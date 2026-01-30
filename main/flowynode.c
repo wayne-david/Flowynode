@@ -41,6 +41,20 @@
 #define BUZZER_PWM_CH    LEDC_CHANNEL_0
 
 SemaphoreHandle_t print_mux = NULL;
+SemaphoreHandle_t data_mutex;
+
+typedef enum {
+    STATE_IDLE = 0,
+    STATE_DONE,
+    STATE_DONE_OFF,
+    STATE_HELP,
+    STATE_HELP_OFF,
+    STATE_TIME_REQ,
+    STATE_TIME_APPROVED   // +X
+} node_state_t;
+static node_state_t current_state = STATE_IDLE;
+volatile int32_t approved_minutes = 0;   // for +X
+char requested_minutes[8];   // for +X
 
 typedef enum{
   HOME,
@@ -56,13 +70,14 @@ typedef struct {
 static uint32_t  msg_id = 0;
 
 typedef struct {
-    char time_label[8];
-    char time_value[8];
+    char time_global[8];
+    char time_local[8];
     char battery[8];
     char time_req[8];
+    char status[16]; 
 } screen_data_t;
 static screen_data_t screen_data;
-static bool screen_changed = true;
+static volatile bool screen_changed = true;
 
 static QueueHandle_t lora_rx_queue;
 static QueueHandle_t lora_tx_queue;
@@ -77,18 +92,16 @@ typedef struct {
 } node_timer_t;
 static node_timer_t timer = {0, 0, false};
 static TimerHandle_t timer_tick;
+
 static void timer_tick_cb(TimerHandle_t xTimer)
 {
     if (timer.running && timer.seconds > 0) {
         timer.seconds--;
-        
-        // convert timer seconds to const char* for display  
-        int minutes = (timer.seconds / 60) % 100;
-        int seconds = timer.seconds % 60;
-
-        snprintf(screen_data.time_label, sizeof(screen_data.time_label), "%02d:%02d", minutes, seconds);
-        snprintf(screen_data.time_value, sizeof(screen_data.time_value), "%02d:%02d", minutes, seconds);
-        screen_changed = true;
+        screen_changed = true; 
+    }
+    else if(timer.running && timer.offset > 0){
+        timer.offset--;
+        screen_changed = true; 
     }
 }
 
@@ -102,6 +115,36 @@ static const char *generate_msg_id(void)
     }
     snprintf(msg_id_str, sizeof(msg_id_str), "%04"PRIu32, msg_id);
     return msg_id_str;
+}
+
+const char *state_to_string(node_state_t state, char *buf, size_t buf_len)
+{
+    switch (state) {
+        case STATE_DONE:
+            return "DONE";
+        
+        case STATE_DONE_OFF:
+            return "DONE OFF";
+
+        case STATE_HELP:
+            return "HELP";
+
+        case STATE_HELP_OFF:
+            return "HELP OFF";
+
+        case STATE_TIME_REQ: {
+            snprintf(buf, buf_len, "REQ : +%s", requested_minutes);
+            return buf;
+        }
+
+        case STATE_TIME_APPROVED:
+            snprintf(buf, buf_len, "TIME +%" PRId32, approved_minutes);
+            return buf;
+
+        case STATE_IDLE:
+        default:
+            return "READY";
+    }
 }
 
 static void buzzer_init_pwm(void) {
@@ -171,12 +214,21 @@ void screen_set_battery(const char *battery)
 
 void screen_set_time(int time_seconds)  //in seconds
 {
-    // convert timer seconds to const char* for display  
-    int minutes = (time_seconds / 60) % 100;
-    int seconds = time_seconds % 60;
+    //convert timer seconds to const char* for display  
+    int global_minutes = (time_seconds / 60) % 100;
+    int global_seconds = time_seconds % 60;
 
-    snprintf(screen_data.time_label, sizeof(screen_data.time_label), "%02d:%02d", minutes, seconds);
-    snprintf(screen_data.time_value, sizeof(screen_data.time_value), "%02d:%02d", minutes, seconds);
+    int local_minutes = ((time_seconds + timer.offset)/ 60) % 100;
+    int local_seconds = (time_seconds + timer.offset) % 60;
+
+    snprintf(screen_data.time_global, sizeof(screen_data.time_global), "%02d:%02d", global_minutes, global_seconds);
+    snprintf(screen_data.time_local, sizeof(screen_data.time_local), "%02d:%02d", local_minutes, local_seconds);
+
+    // int minutes = (timer.seconds / 60) % 100;
+    // int seconds = timer.seconds % 60;
+
+    // snprintf(screen_data.time_global, sizeof(screen_data.time_global), "%02d:%02d", minutes, seconds);
+    // snprintf(screen_data.time_local, sizeof(screen_data.time_local), "%02d:%02d", minutes, seconds);
 
     screen_changed = true;
 }
@@ -186,8 +238,19 @@ void screen_set_time_req(int time_seconds)  //in seconds
     // convert timer seconds to const char* for display  
     int minutes = (time_seconds / 60) % 100;
     int seconds = time_seconds % 60;
-
+    
+    snprintf(requested_minutes, sizeof(requested_minutes), "%02d", minutes);
     snprintf(screen_data.time_req, sizeof(screen_data.time_req), "%02d:%02d", minutes, seconds);
+    screen_changed = true;
+}
+
+void screen_set_state(node_state_t state)
+{
+    char tmp[16];
+    const char *s = state_to_string(state, tmp, sizeof(tmp));
+
+    strncpy(screen_data.status, s, sizeof(screen_data.status) - 1);
+    screen_data.status[sizeof(screen_data.status) - 1] = '\0';
     screen_changed = true;
 }
 
@@ -196,15 +259,31 @@ void task_update_screen(void *p) {
     OLEDDisplay_t *oled = OLEDDisplay_init(I2C_MASTER_NUM,0x78,I2C_MASTER_SDA_IO,I2C_MASTER_SCL_IO);
     OLEDDisplay_flipScreenVertically(oled);
     screen_data_t screen_msg;
-
+    char time_offset[12]; 
+               
     for(;;) {
         if (!screen_changed)
         {
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
         screen_changed = false;
-        screen_msg = screen_data;
+       
+        if (xSemaphoreTake(data_mutex, 0) == pdTRUE) {
+            int global_minutes = (timer.seconds / 60) % 100;
+            int global_seconds = timer.seconds % 60;
+
+            int local_minutes = ((timer.seconds + timer.offset)/ 60) % 100;
+            int local_seconds = (timer.seconds + timer.offset) % 60;
+            int offset_minutes = (timer.offset/60);
+
+            snprintf(screen_data.time_global, sizeof(screen_data.time_global), "%02d:%02d", global_minutes, global_seconds);
+            snprintf(screen_data.time_local, sizeof(screen_data.time_local), "%02d:%02d", local_minutes, local_seconds);
+            snprintf(time_offset, sizeof(time_offset), "+%02d", offset_minutes);
+
+            screen_msg = screen_data;
+            xSemaphoreGive(data_mutex);
+        }
         
         OLEDDisplay_clear(oled);
         // //First Row
@@ -214,18 +293,31 @@ void task_update_screen(void *p) {
 
         OLEDDisplay_setTextAlignment(oled,TEXT_ALIGN_CENTER);
         OLEDDisplay_setFont(oled,ArialMT_Plain_10);
-        OLEDDisplay_drawString(oled,64, 00, screen_msg.time_label);
+        OLEDDisplay_drawString(oled,64, 00, screen_msg.time_global);
+
+        OLEDDisplay_setTextAlignment(oled,TEXT_ALIGN_CENTER);
+        OLEDDisplay_setFont(oled,ArialMT_Plain_10);
+        OLEDDisplay_drawString(oled,120, 00, NODEID);
 
         switch (current_screen) {
             case HOME:
                 OLEDDisplay_setTextAlignment(oled,TEXT_ALIGN_CENTER);
                 OLEDDisplay_setFont(oled,ArialMT_Plain_24);
-                OLEDDisplay_drawString(oled,64, 20, screen_msg.time_value);
+                OLEDDisplay_drawString(oled,64, 20, screen_msg.time_local);
 
+                OLEDDisplay_setTextAlignment(oled,TEXT_ALIGN_RIGHT);
+                OLEDDisplay_setFont(oled,ArialMT_Plain_10);
+                OLEDDisplay_drawString(oled,120, 25, time_offset);
+
+                // OLEDDisplay_display(oled);
+                // vTaskDelay(pdMS_TO_TICKS(50));
+
+                OLEDDisplay_setTextAlignment(oled, TEXT_ALIGN_LEFT);
+                OLEDDisplay_setFont(oled, ArialMT_Plain_10);
+                OLEDDisplay_drawString(oled, 00, 54, screen_msg.status);
                 OLEDDisplay_display(oled);
                 vTaskDelay(pdMS_TO_TICKS(50));
                 break;
-
 
             case TIME_REQ:
                 OLEDDisplay_setTextAlignment(oled,TEXT_ALIGN_CENTER);
@@ -247,9 +339,20 @@ void task_update_screen(void *p) {
 void task_input(void *p) {
     int last_done = 1, last_help = 1;
     int last_clk = 1, last_dt = 1, last_sw = 1;
-    int rotary_state = 0;
     bool rotary_active = false;
+    bool done_active = false;
+    bool help_active = false;
+
     msg_t msg;
+    static const int8_t rotary_table[16] = {
+        0, -1, +1,  0,
+        +1,  0,  0, -1,
+        -1,  0,  0, +1,
+        0, +1, -1,  0
+    };
+    uint8_t last_rotary_state = 0;
+    int8_t rotary_accum = 0;
+    int rotary_state = 0;
 
     while (1) {
         int done = gpio_get_level(DONE_BUTTON_GPIO);
@@ -260,12 +363,26 @@ void task_input(void *p) {
 
         // DONE button press
         if (last_done == 1 && done == 0) {
-            memset(&msg, 0, sizeof(msg));
-            const char *msg_id = generate_msg_id();
-            proto_done((char *)msg.data, sizeof(msg.data), NODEID, msg_id);
-            msg.len = strlen((char *)msg.data);
-            xQueueSend(lora_tx_queue, &msg, 0);
-
+            if(!done_active){
+                done_active = true;
+                memset(&msg, 0, sizeof(msg));
+                const char *msg_id = generate_msg_id();
+                proto_done((char *)msg.data, sizeof(msg.data), NODEID, msg_id);
+                msg.len = strlen((char *)msg.data);
+                xQueueSend(lora_tx_queue, &msg, 0);
+                current_state = STATE_DONE;
+                screen_set_state(current_state);
+            }
+            else{
+                done_active = false;
+                memset(&msg, 0, sizeof(msg));
+                const char *msg_id = generate_msg_id();
+                proto_done_off((char *)msg.data, sizeof(msg.data), NODEID, msg_id);
+                msg.len = strlen((char *)msg.data);
+                xQueueSend(lora_tx_queue, &msg, 0);
+                current_state = STATE_DONE_OFF;
+                screen_set_state(current_state);
+            }
             buzzer_beep(250);
             ESP_LOGI("INPUT", "Event Sent: %.*s", msg.len, msg.data);
         }
@@ -273,12 +390,28 @@ void task_input(void *p) {
 
         // HELP button press
         if (last_help == 1 && help == 0) {
-            memset(&msg, 0, sizeof(msg));
-            const char *msg_id = generate_msg_id();
-            proto_help((char *)msg.data, sizeof(msg.data), NODEID, msg_id);
-            msg.len = strlen((char *)msg.data);
-            xQueueSend(lora_tx_queue, &msg, 0);
+            if(!help_active){
+                help_active = true;
 
+                memset(&msg, 0, sizeof(msg));
+                const char *msg_id = generate_msg_id();
+                proto_help((char *)msg.data, sizeof(msg.data), NODEID, msg_id);
+                msg.len = strlen((char *)msg.data);
+                xQueueSend(lora_tx_queue, &msg, 0);
+                current_state = STATE_HELP;
+                screen_set_state(current_state);
+            }
+            else{
+                help_active = false;
+
+                memset(&msg, 0, sizeof(msg));
+                const char *msg_id = generate_msg_id();
+                proto_help_off((char *)msg.data, sizeof(msg.data), NODEID, msg_id);
+                msg.len = strlen((char *)msg.data);
+                xQueueSend(lora_tx_queue, &msg, 0);
+                current_state = STATE_HELP_OFF;
+                screen_set_state(current_state);
+            }
             buzzer_beep(250);
             ESP_LOGI("INPUT", "Event Sent: %.*s", msg.len, msg.data);
         }
@@ -308,6 +441,9 @@ void task_input(void *p) {
                 msg.len = strlen((char *)msg.data);
                 xQueueSend(lora_tx_queue, &msg, 0);
 
+                current_state = STATE_TIME_REQ;
+                screen_set_state(current_state);
+                
                 buzzer_beep(250);
                 ESP_LOGI("INPUT", "Rotary Event Sent: %.*s", msg.len, msg.data);
 
@@ -318,31 +454,42 @@ void task_input(void *p) {
         }
         last_sw = sw;
 
-        // Rotary encoder (only active if SW has enabled it)
-        if (rotary_active && (last_clk != clk || last_dt != dt)) {
-            if (last_clk == 0 && clk == 1) {  // rising edge of CLK
-                if (dt == 0) {
-                    rotary_state++;
-                } else {
-                    rotary_state--;
+        if (rotary_active) {
+            uint8_t clk = gpio_get_level(ROTARY_CLK_GPIO);
+            uint8_t dt  = gpio_get_level(ROTARY_DT_GPIO);
+            uint8_t new_state = (clk << 1) | dt;
+
+            if (new_state != last_rotary_state) {
+                int8_t delta = rotary_table[(last_rotary_state << 2) | new_state];
+
+                if (delta != 0) {
+                    rotary_accum += delta;
+
+                    // One detent = 4 transitions
+                    if (rotary_accum >= 4) {
+                        rotary_state++;
+                        rotary_accum = 0;
+                    } else if (rotary_accum <= -4) {
+                        rotary_state--;
+                        rotary_accum = 0;
+                    }
+
+                    // Clamp
+                    if (rotary_state < 0) rotary_state = 0;
+                    if (rotary_state > 99) rotary_state = 99;
+
+                    if (current_screen == TIME_REQ) {
+                        screen_set_time_req(rotary_state * 60);
+                    }
                 }
 
-                // Clamp rotary_state
-                if (rotary_state < 0) rotary_state = 0;
-                if (rotary_state > 99) rotary_state = 99;
-
-                ESP_LOGI("INPUT", "Rotary changed: %d", rotary_state);
-
-                // Update screen only if TIME_REQ screen is active
-                if (current_screen == TIME_REQ) {
-                    screen_set_time_req(rotary_state * 60);
-                }
+                last_rotary_state = new_state;
             }
         }
         last_clk = clk;
         last_dt = dt;
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
@@ -360,7 +507,7 @@ void task_lora_rx_tx(void *p)
             x = lora_receive_packet(buf, sizeof(buf));
             buf[x] = 0;
 
-            ESP_LOGI("LORA", "RX: %s | RSSI=%d", buf, lora_packet_rssi());
+            //ESP_LOGI("LORA", "RX: %s | RSSI=%d", buf, lora_packet_rssi());
 
             memset(&msg, 0, sizeof(msg));  
             strncpy((char*)msg.data, (const char*)buf, MSG_MAX_LEN-1);
@@ -371,7 +518,7 @@ void task_lora_rx_tx(void *p)
 
         if (xQueueReceive(lora_tx_queue, &tx_msg, 0) == pdTRUE)
         {
-            ESP_LOGI("LORA SEND", "Sending: %.*s", sizeof(tx_msg.data), tx_msg.data);
+            //ESP_LOGI("LORA SEND", "Sending: %.*s", sizeof(tx_msg.data), tx_msg.data);
             lora_send_packet(tx_msg.data, tx_msg.len);
         }
         vTaskDelay(pdMS_TO_TICKS(10)); 
@@ -387,13 +534,6 @@ void task_lora_parse(void *p)
     for (;;) {
         if (xQueueReceive(lora_rx_queue, &message, portMAX_DELAY) == pdTRUE) {
             if (parse_inbound_message((char *)message.data, &parsed)) {
-                ESP_LOGI("LORA_PARSE",
-                    "Type=%d Node=%d MsgID=%d Value=%d",
-                    parsed.type,
-                    parsed.node_id,
-                    parsed.msg_id,
-                    parsed.value
-                );
                 
                 if (parsed.node_id[0] != '\0' && strcmp(parsed.node_id, NODEID) != 0) {
                     // Not for this node, skip
@@ -407,6 +547,7 @@ void task_lora_parse(void *p)
                         const char *msg_id = generate_msg_id();
                         proto_ver((char *)tx_msg.data, sizeof(tx_msg.data), NODEID,FW_VERSION, msg_id);
                         xQueueSend(lora_tx_queue, &tx_msg, portMAX_DELAY);
+                        break;
 
                     case IN_CMD_TSET:
                         timer.seconds = parsed.value * 60;  // minutes -> seconds
@@ -428,30 +569,31 @@ void task_lora_parse(void *p)
                         break;
 
                     case IN_CMD_TSYNC:
-                        timer.seconds = parsed.value * 60;  // minutes -> seconds
+                        timer.seconds = parsed.value;
                         screen_set_time(timer.seconds);
                         send_ack = true;
                         // sync time
                         break;
 
                     case IN_CMD_TADD:
-                        timer.offset += parsed.value * 60;
-                        timer.seconds += parsed.value * 60;
-                        screen_set_time(timer.seconds);
+                        timer.offset += parsed.value*60;
+                        approved_minutes = parsed.value;
+                        current_state = STATE_TIME_APPROVED;
+                        screen_set_state(current_state);
                         send_ack = true;
                         // add time offset for node
                         break;
 
                     case IN_CMD_CLEAR_OFFSET:
                         timer.offset = 0;
-                        timer.seconds -= timer.offset;  
+                        timer.seconds = 0;  
                         send_ack = true;
                         // clear time offset for node
                         break;
 
                     case IN_CMD_CLEAR_OFFSET_ALL:
                         timer.offset = 0;
-                        timer.seconds -= timer.offset;  
+                        timer.seconds = 0;  
                         // time offset for all nodes
                         break;
 
@@ -512,7 +654,7 @@ void task_lora_parse(void *p)
                     proto_ack((char *)tx_msg.data, sizeof(tx_msg.data),proto_cmd_inbound_to_str(parsed.type), NODEID,msg_id_str);
                     xQueueSend(lora_tx_queue, &tx_msg, portMAX_DELAY);
 
-                    ESP_LOGI("ACK", "ACK Event Sent: %s", msg);
+                    //ESP_LOGI("ACK", "ACK Event Sent: %s", msg_id_str);
 
                 }
 
@@ -520,6 +662,7 @@ void task_lora_parse(void *p)
                 ESP_LOGW("LORA_PARSE", "Invalid message: %s", message.data);
             }
         }
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -551,6 +694,8 @@ void task_send_ping(void *p)
 
 void app_main()
 {
+    esp_log_level_set("*", ESP_LOG_NONE);
+
     while (!lora_init()) {
         ESP_LOGI("LORA", "Waiting for LoRa...");
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -561,6 +706,9 @@ void app_main()
     lora_enable_crc();
 
     ESP_LOGI("LORA", "LoRa initialized successfully");
+
+    data_mutex = xSemaphoreCreateMutex();
+    assert(data_mutex != NULL);
 
     gpio_init_inputs();
     gpio_init_buzzer();
@@ -578,21 +726,25 @@ void app_main()
     );
     xTimerStart(timer_tick, 0);
 
-     // convert timer seconds to const char* for display
+    // convert timer seconds to const char* for display
+    char tmp[16];
     int minutes = (0 / 60) % 100;
     int seconds = 0 % 60;
 
-    snprintf(screen_data.time_label, sizeof(screen_data.time_label), "00:00");
-    snprintf(screen_data.time_value, sizeof(screen_data.time_value), "%02d:%02d", minutes, seconds);
+    snprintf(screen_data.time_global, sizeof(screen_data.time_global), "00:00");
+    snprintf(screen_data.time_local, sizeof(screen_data.time_local), "%02d:%02d", minutes, seconds);
     snprintf(screen_data.battery, sizeof(screen_data.battery), "85%%");
+    const char *s = state_to_string(current_state, tmp, sizeof(tmp));
+    strncpy(screen_data.status, s, sizeof(screen_data.status) - 1);
+    screen_data.status[sizeof(screen_data.status) - 1] = '\0';
     screen_changed = true;
 
 
     xTaskCreatePinnedToCore(task_lora_rx_tx, "task_lora_tx_rx", 4096, NULL, 6, NULL,1);
     xTaskCreatePinnedToCore(task_input, "task_input", 4096, NULL, 5, NULL,1);
 
+    xTaskCreatePinnedToCore(task_update_screen, "update_screen_task", 8192, NULL, 5, NULL,0);
     xTaskCreatePinnedToCore(task_lora_parse, "task_lora_parse", 4096, NULL, 5, NULL,0);
-    xTaskCreatePinnedToCore(task_update_screen, "update_screen_task", 4096, NULL, 5, NULL,0);
     xTaskCreatePinnedToCore(task_send_ping, "task_send_ping", 2048, NULL, 5, NULL,0);
     
     ESP_LOGI("STACK", "free=%d",

@@ -6,7 +6,7 @@
     "interface/ftdi/esp_ftdi.cfg",
     "target/esp32.cfg"
   ],
-  "idf.portWin": "COM11",
+  "idf.portWin": "COM6",
   "idf.toolsPathWin": "C:\\Users\\wayne\\.espressif",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
@@ -18,5 +18,5 @@
     "--compile-commands-dir=e:\\Maciej\\FlowyNode\\build"
   ],
   "idf.flashType": "UART",
-  "idf.monitorPort": "COM11"
+  "idf.monitorPort": "COM6"
 }

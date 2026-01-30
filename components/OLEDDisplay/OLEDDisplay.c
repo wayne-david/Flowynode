@@ -496,7 +496,7 @@ void OLEDDisplay_drawVerticalLine(OLEDDisplay_t *oled, int16_t x, int16_t y, int
   }
 
   if (length > 0) {
-    drawBit = (1 << ((length <= 8 ? length : 8))) - 1;
+    drawBit = (1 << (length & 7)) - 1;
     switch (oled->color) {
       case WHITE:   *bufferPtr |=  drawBit; break;
       case BLACK:   *bufferPtr &= ~drawBit; break;
@@ -952,7 +952,7 @@ void OLEDDisplay_setGeometry(OLEDDisplay_t *oled, OLEDDISPLAY_GEOMETRY g, uint16
       oled->height = height > 0 ? height : 64;
       break;
   }
-  oled->displayBufferSize = oled->width * oled->height / 8;
+  oled->displayBufferSize = width * oled->height / 8;
 }
 
 void OLEDDisplay_sendInitCommands(OLEDDisplay_t *oled) {
@@ -1000,157 +1000,59 @@ void OLEDDisplay_sendInitCommands(OLEDDisplay_t *oled) {
 
     OLEDDisplay_sendCommand(oled, 0xAF); // Display ON
   #endif
-
   #ifdef OLED_SSD1306
-    if (!oled || oled->geometry == GEOMETRY_RAWMODE)
-        return;
+    if (oled->geometry == GEOMETRY_RAWMODE)
+      return;
+    OLEDDisplay_sendCommand(oled,DISPLAYOFF);
+    OLEDDisplay_sendCommand(oled,SETDISPLAYCLOCKDIV);
+    OLEDDisplay_sendCommand(oled,0xF0); // Increase speed of the display max ~96Hz
+    OLEDDisplay_sendCommand(oled,SETMULTIPLEX);
+    OLEDDisplay_sendCommand(oled,oled->height - 1);
+    OLEDDisplay_sendCommand(oled,SETDISPLAYOFFSET);
+    OLEDDisplay_sendCommand(oled,0x00);
+    if(oled->geometry == GEOMETRY_64_32)
+      OLEDDisplay_sendCommand(oled,0x00);  
+    else
+      OLEDDisplay_sendCommand(oled,SETSTARTLINE);
+    OLEDDisplay_sendCommand(oled,CHARGEPUMP);
+    OLEDDisplay_sendCommand(oled,0x14);
+    OLEDDisplay_sendCommand(oled,MEMORYMODE);
+    OLEDDisplay_sendCommand(oled,0x00);
+    OLEDDisplay_sendCommand(oled,SEGREMAP);
+    OLEDDisplay_sendCommand(oled,COMSCANINC);
+    OLEDDisplay_sendCommand(oled,SETCOMPINS);
 
-    // Turn display off before initializing
-    OLEDDisplay_sendCommand(oled, DISPLAYOFF);
-
-    // Set memory addressing mode to horizontal
-    OLEDDisplay_sendCommand(oled, MEMORYMODE);
-    OLEDDisplay_sendCommand(oled, 0x00); // Horizontal addressing
-
-    // Set display clock divide ratio / oscillator frequency
-    OLEDDisplay_sendCommand(oled, SETDISPLAYCLOCKDIV);
-    OLEDDisplay_sendCommand(oled, 0xF0); // Faster display (~96 Hz)
-
-    // Set multiplex ratio (depends on display height)
-    OLEDDisplay_sendCommand(oled, SETMULTIPLEX);
-    OLEDDisplay_sendCommand(oled, oled->height - 1);
-
-    // Set display offset (vertical)
-    OLEDDisplay_sendCommand(oled, SETDISPLAYOFFSET);
-    OLEDDisplay_sendCommand(oled, 0x00);
-
-    // Set start line
-    if (oled->geometry != GEOMETRY_64_32)
-        OLEDDisplay_sendCommand(oled, SETSTARTLINE);
-
-    // Enable charge pump
-    OLEDDisplay_sendCommand(oled, CHARGEPUMP);
-    OLEDDisplay_sendCommand(oled, 0x14); // Internal VCC
-
-    // Set segment remap and COM scan direction
-    OLEDDisplay_sendCommand(oled, SEGREMAP); // Flip horizontally if needed
-    OLEDDisplay_sendCommand(oled, COMSCANINC); // COM scan direction
-
-    // Set COM pins configuration based on geometry
-    OLEDDisplay_sendCommand(oled, SETCOMPINS);
-    switch (oled->geometry) {
-        case GEOMETRY_128_64:
-        case GEOMETRY_64_48:
-        case GEOMETRY_64_32:
-            OLEDDisplay_sendCommand(oled, 0x12);
-            break;
-        case GEOMETRY_128_32:
-            OLEDDisplay_sendCommand(oled, 0x02);
-            break;
-        default:
-            OLEDDisplay_sendCommand(oled, 0x12); // default safe
-            break;
+    if (oled->geometry == GEOMETRY_128_64 || oled->geometry == GEOMETRY_64_48 || oled->geometry == GEOMETRY_64_32) {
+      OLEDDisplay_sendCommand(oled,0x12);
+    } else if (oled->geometry == GEOMETRY_128_32) {
+      OLEDDisplay_sendCommand(oled,0x02);
     }
 
-    // Set contrast based on geometry
-    OLEDDisplay_sendCommand(oled, SETCONTRAST);
-    switch (oled->geometry) {
-        case GEOMETRY_128_64:
-        case GEOMETRY_64_48:
-        case GEOMETRY_64_32:
-            OLEDDisplay_sendCommand(oled, 0xCF);
-            break;
-        case GEOMETRY_128_32:
-            OLEDDisplay_sendCommand(oled, 0x8F);
-            break;
-        default:
-            OLEDDisplay_sendCommand(oled, 0xCF);
-            break;
+    OLEDDisplay_sendCommand(oled,SETCONTRAST);
+
+    if (oled->geometry == GEOMETRY_128_64 || oled->geometry == GEOMETRY_64_48 || oled->geometry == GEOMETRY_64_32) {
+      OLEDDisplay_sendCommand(oled,0xCF);
+    } else if (oled->geometry == GEOMETRY_128_32) {
+      OLEDDisplay_sendCommand(oled,0x8F);
     }
 
-    // Set pre-charge period
-    OLEDDisplay_sendCommand(oled, SETPRECHARGE);
-    OLEDDisplay_sendCommand(oled, 0xF1);
+    OLEDDisplay_sendCommand(oled,SETPRECHARGE);
+    OLEDDisplay_sendCommand(oled,0xF1);
+    OLEDDisplay_sendCommand(oled,SETVCOMDETECT); //0xDB, (additionally needed to lower the contrast)
+    OLEDDisplay_sendCommand(oled,0x40);	        //0x40 default, to lower the contrast, put 0
+    OLEDDisplay_sendCommand(oled,DISPLAYALLON_RESUME);
+    OLEDDisplay_sendCommand(oled,NORMALDISPLAY);
+    OLEDDisplay_sendCommand(oled,0x2e);            // stop scroll
+    OLEDDisplay_sendCommand(oled,DISPLAYON);
 
-    // Set VCOMH deselect level
-    OLEDDisplay_sendCommand(oled, SETVCOMDETECT);
-    OLEDDisplay_sendCommand(oled, 0x40);
+    OLEDDisplay_sendCommand(oled,COLUMNADDR);
+    OLEDDisplay_sendCommand(oled,0x00);
+    OLEDDisplay_sendCommand(oled,0x7f);
 
-    // Resume to RAM content display
-    OLEDDisplay_sendCommand(oled, DISPLAYALLON_RESUME);
-    OLEDDisplay_sendCommand(oled, NORMALDISPLAY);
-
-    // Stop any scrolling
-    OLEDDisplay_sendCommand(oled, 0x2E);
-
-    // Turn display on
-    OLEDDisplay_sendCommand(oled, DISPLAYON);
-
-    // Set column address (0 - 127 for 128-pixel wide displays)
-    OLEDDisplay_sendCommand(oled, COLUMNADDR);
-    OLEDDisplay_sendCommand(oled, 0x00);
-    OLEDDisplay_sendCommand(oled, 0x7F);
-
-    // Set page address (0 - 7 for 64-pixel high displays)
-    OLEDDisplay_sendCommand(oled, PAGEADDR);
-    OLEDDisplay_sendCommand(oled, 0x00);
-    OLEDDisplay_sendCommand(oled, (oled->height / 8) - 1);
-  #endif
-
-  // #ifdef OLED_SSD1306
-  //   if (oled->geometry == GEOMETRY_RAWMODE)
-  //     return;
-  //   OLEDDisplay_sendCommand(oled,DISPLAYOFF);
-    
-  //   OLEDDisplay_sendCommand(oled,SETDISPLAYCLOCKDIV);
-  //   OLEDDisplay_sendCommand(oled,0xF0); // Increase speed of the display max ~96Hz
-  //   OLEDDisplay_sendCommand(oled,SETMULTIPLEX);
-  //   OLEDDisplay_sendCommand(oled,oled->height - 1);
-  //   OLEDDisplay_sendCommand(oled,SETDISPLAYOFFSET);
-  //   OLEDDisplay_sendCommand(oled,0x00);
-  //   if(oled->geometry == GEOMETRY_64_32)
-  //     OLEDDisplay_sendCommand(oled,0x00);  
-  //   else
-  //     OLEDDisplay_sendCommand(oled,SETSTARTLINE);
-  //   OLEDDisplay_sendCommand(oled,CHARGEPUMP);
-  //   OLEDDisplay_sendCommand(oled,0x14);
-  //   OLEDDisplay_sendCommand(oled,MEMORYMODE);
-  //   OLEDDisplay_sendCommand(oled,0x00);
-  //   OLEDDisplay_sendCommand(oled,SEGREMAP);
-  //   OLEDDisplay_sendCommand(oled,COMSCANINC);
-  //   OLEDDisplay_sendCommand(oled,SETCOMPINS);
-
-  //   if (oled->geometry == GEOMETRY_128_64 || oled->geometry == GEOMETRY_64_48 || oled->geometry == GEOMETRY_64_32) {
-  //     OLEDDisplay_sendCommand(oled,0x12);
-  //   } else if (oled->geometry == GEOMETRY_128_32) {
-  //     OLEDDisplay_sendCommand(oled,0x02);
-  //   }
-
-  //   OLEDDisplay_sendCommand(oled,SETCONTRAST);
-
-  //   if (oled->geometry == GEOMETRY_128_64 || oled->geometry == GEOMETRY_64_48 || oled->geometry == GEOMETRY_64_32) {
-  //     OLEDDisplay_sendCommand(oled,0xCF);
-  //   } else if (oled->geometry == GEOMETRY_128_32) {
-  //     OLEDDisplay_sendCommand(oled,0x8F);
-  //   }
-
-  //   OLEDDisplay_sendCommand(oled,SETPRECHARGE);
-  //   OLEDDisplay_sendCommand(oled,0xF1);
-  //   OLEDDisplay_sendCommand(oled,SETVCOMDETECT); //0xDB, (additionally needed to lower the contrast)
-  //   OLEDDisplay_sendCommand(oled,0x40);	        //0x40 default, to lower the contrast, put 0
-  //   OLEDDisplay_sendCommand(oled,DISPLAYALLON_RESUME);
-  //   OLEDDisplay_sendCommand(oled,NORMALDISPLAY);
-  //   OLEDDisplay_sendCommand(oled,0x2e);            // stop scroll
-  //   OLEDDisplay_sendCommand(oled,DISPLAYON);
-
-  //   OLEDDisplay_sendCommand(oled,COLUMNADDR);
-  //   OLEDDisplay_sendCommand(oled,0x00);
-  //   OLEDDisplay_sendCommand(oled,0x7f);
-
-  //   OLEDDisplay_sendCommand(oled,PAGEADDR);
-  //   OLEDDisplay_sendCommand(oled,0x00);
-  //   OLEDDisplay_sendCommand(oled,0x07);
-  // #endif 
+    OLEDDisplay_sendCommand(oled,PAGEADDR);
+    OLEDDisplay_sendCommand(oled,0x00);
+    OLEDDisplay_sendCommand(oled,0x07);
+  #endif 
 }
 
 void inline OLEDDisplay_drawInternal(OLEDDisplay_t *oled, int16_t xMove, int16_t yMove, int16_t width, int16_t height, const uint8_t *data, uint16_t offset, uint16_t bytesInData) {
